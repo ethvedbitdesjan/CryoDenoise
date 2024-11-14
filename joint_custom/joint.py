@@ -121,9 +121,9 @@ class JointNetwork(nn.Module):
         
         # Encoder path
         for enc in self.encoder:
+            #print(x.shape, 'x in enc')
             x = enc(x)
             enc_features.append(x)
-            #print(x.shape, 'enc')
         # Decoder path with skip connections
         for i, dec in enumerate(self.decoder):
             x = torch.cat([x, enc_features[-(i+1)]], dim=1)

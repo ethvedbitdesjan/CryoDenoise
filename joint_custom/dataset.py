@@ -22,15 +22,27 @@ def extract_segmentation_map(img, particles):
     segment_map = torch.FloatTensor(segment_map)
     #convert to grayscale
     segment_map = segment_map.unsqueeze(0)
+    #TODO: convert to binary
     return segment_map
 
-def extract_gaussian_maps(self, img_shape, particles):
+def extract_gaussian_map(img, particles):
+    img_shape = img.shape[-2:]
     heatmap = np.zeros(img_shape)
     for x, y, radius in particles:
-        heatmap += create_gaussian_heatmap(img_shape, (y, x), radius)
+        #heatmap += create_gaussian_heatmap(img_shape, (y, x), radius)
+        heatmap += create_binary_heatmap(img_shape, (y, x), radius)
     heatmap = np.clip(heatmap, 0, 1)  # Normalize overlapping regions
-    return torch.FloatTensor(heatmap)
-    
+    return torch.FloatTensor(heatmap).unsqueeze(0) #add channel dimension
+
+def create_binary_heatmap(shape, center, radius):
+    """Create binary 0/1 targets instead of Gaussian"""
+    heatmap = np.zeros(shape)
+    y, x = np.ogrid[:shape[0], :shape[1]]
+    center_y, center_x = center
+    r2 = (x - center_x)**2 + (y - center_y)**2 + 1e-6
+    heatmap[r2 <= radius**2] = 1.0
+    return heatmap
+
 def create_gaussian_heatmap(shape, center, radius, sigma=None):
     """
     """
@@ -88,7 +100,7 @@ class CryoEMDataset(torch.utils.data.Dataset):
         file_name = image_filepath.split('/')[-1].split('.')[0]
         if self.particle_coords is not None:
             particles = self.particle_coords[file_name]
-            seg_map = extract_segmentation_map(img, particles)
+            seg_map = extract_gaussian_map(img, particles)
         else:
             raise ValueError('Particle coordinates must be provided')
         
@@ -134,6 +146,13 @@ def collate_fn(batch):
 def collate_with_padding(batch):
     max_h = max(x['image'].shape[-2] for x in batch)
     max_w = max(x['image'].shape[-1] for x in batch)
+    
+    # ensure 2^5 divisible dimensions for UNet where 5 down/up sampling occurs
+    if max_h % 32:
+        max_h = max_h + (32 - max_h % 32)
+    if max_w % 32:
+        max_w = max_w + (32 - max_w % 32)
+    
     
     padded_batch = []
     padding_masks = []

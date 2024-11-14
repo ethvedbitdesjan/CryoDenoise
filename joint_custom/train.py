@@ -15,7 +15,7 @@ from collections import defaultdict
 def log_images(images, predictions, targets, step, prefix="val"):
     """Helper function to log images to WandB"""
     # Take first few images from batch
-    n_samples = min(4, images.shape[0])
+    n_samples = min(2, images.shape[0])
     
     image_logs = {}
     for idx in range(n_samples):
@@ -36,13 +36,16 @@ def log_images(images, predictions, targets, step, prefix="val"):
         
         # Ground truth heatmap
         plt.subplot(121)
-        plt.imshow(targets['heatmap'][idx].cpu(), cmap='viridis')
+        # print(targets['heatmap'][idx], 'heatmap')
+        plt.imshow(targets['heatmap'][idx].cpu().squeeze(0), cmap='gray', vmin=0, vmax=1)
         plt.title("Ground Truth Heatmap")
         plt.colorbar()
         
         # Predicted heatmap
         plt.subplot(122)
-        plt.imshow(predictions['detection'][idx].cpu(), cmap='viridis')
+        detection_map = predictions['detection'][idx].cpu().squeeze(0)
+        detection_map = (detection_map > 0.5).float()
+        plt.imshow(detection_map, cmap='gray', vmin=0, vmax=1)
         plt.title("Predicted Heatmap")
         plt.colorbar()
         
@@ -79,6 +82,7 @@ def calculate_metrics(predictions, targets, padding_mask=None):
     #     orig.cpu().numpy(),
     #     data_range=1.0
     # )
+    metrics['ssim'] = 0
     
     # Detection metrics
     pred_heatmap = predictions['detection']
@@ -130,24 +134,24 @@ def validate(model, val_loader, criterion, device, global_step):
         denoise_stats, detect_out, noise_est = model(images)
         
         loss, loss_stats = criterion(
-            denoise_stats, detect_out, images, heatmaps, 
+            denoise_stats, noise_est, detect_out, images, heatmaps, 
             padding_mask=padding_mask
         )
         
         for k, v in loss_stats.items():
             val_stats[k] += v
-        
+        # val_stats['total_loss'] += loss.detach().cpu().item()
         predictions = {
-            'denoised': denoise_stats[:, 0],  # mean
-            'variance': torch.exp(denoise_stats[:, 1]),  # variance
-            'detection': detect_out
+            'denoised_mean': denoise_stats[:, 0].unsqueeze(1),  # mean
+            'variance': torch.exp(denoise_stats[:, 1].unsqueeze(1)),  # variance
+            'detection': detect_out,
+            'denoised': model.reparameterize(denoise_stats, noise_est)
         }
-        
         targets = {
             'image': images,
             'heatmap': heatmaps
         }
-        
+        #print(predictions['denoised'].shape, 'predictions', targets['image'].shape, 'targets', padding_mask.shape, 'mask', targets['heatmap'].shape, 'heatmap')
         batch_metrics = calculate_metrics(predictions, targets, padding_mask)
         for k, v in batch_metrics.items():
             all_metrics[k].append(v)
@@ -182,20 +186,20 @@ def validate(model, val_loader, criterion, device, global_step):
     
     return avg_metrics
 
-def train(model, train_loader, val_loader, num_epochs, device):
+def train(model, train_loader, val_loader, num_epochs, device, LR=1e-4, output_path="best_model.pth", denoiser_loss_weight=0.75):
     wandb.init(project="cryo-em-joint", config={
-        "learning_rate": 1e-4,
+        "learning_rate": LR,
         "denoising_weight": 0.75,
         "consistency_weight": 0.1,
         "batch_size": train_loader.batch_size,
         "epochs": num_epochs
     })
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=num_epochs, eta_min=1e-6
     )
-    criterion = JointLoss()
+    criterion = JointLoss(denoising_weight=denoiser_loss_weight)
     
     best_val_f1 = 0
     global_step = 0
@@ -210,12 +214,29 @@ def train(model, train_loader, val_loader, num_epochs, device):
             padding_mask = batch['padding_mask'].to(device)
             denoise_stats, detect_out, noise_est = model(imgs)
             
+            assert torch.all(heatmaps >= 0) and torch.all(heatmaps <= 1), \
+            f"Heatmap values outside [0,1]: min={heatmaps.min()}, max={heatmaps.max()}"
+            
+            assert torch.all(detect_out >= 0) and torch.all(detect_out <= 1), \
+            f"Detection map values outside [0,1]: min={detect_out.min()}, max={detect_out.max()}"
+            
             loss, loss_stats = criterion(
                 denoise_stats, noise_est, detect_out, imgs, heatmaps,
                 padding_mask=padding_mask
             )
+            
+            
+            
             optimizer.zero_grad()
             loss.backward()
+            total_grad = 0
+            # for p in model.parameters():
+            #     if p.grad is not None:
+            #         total_grad += p.grad.data.norm(2).item()
+            # print(f"Total gradient magnitude: {total_grad}")
+            # print(f"Learning rate: {scheduler.get_last_lr()[0]}")
+            # print("Loss stats: ", loss_stats)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
             optimizer.step()
             
             # Update stats
@@ -224,7 +245,7 @@ def train(model, train_loader, val_loader, num_epochs, device):
             
             global_step += 1
             
-            if global_step % 100 == 0:
+            if global_step % 1000 == 0:
                 wandb.log({
                     "batch_loss": loss.item(),
                     "learning_rate": scheduler.get_last_lr()[0],
@@ -241,7 +262,7 @@ def train(model, train_loader, val_loader, num_epochs, device):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'best_f1': best_val_f1,
-            }, 'best_model.pth')
+            }, output_path)
             
             wandb.log({
                 "best_val_f1": best_val_f1
@@ -264,6 +285,9 @@ def get_args():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_epochs", type=int, default=20)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--lr", type=float, default=1e-1)
+    parser.add_argument("--output_path", type=str, default="best_model.pth")
+    parser.add_argument("--denoiser_loss_weight", type=float, default=0.75)
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -285,5 +309,5 @@ if __name__ == "__main__":
     model.to(args.device)
     
     # Start training
-    train(model, train_loader, val_loader, args.num_epochs, args.device)
+    train(model, train_loader, val_loader, args.num_epochs, args.device, args.lr, args.output_path, args.denoiser_loss_weight)
     

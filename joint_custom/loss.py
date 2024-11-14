@@ -11,13 +11,22 @@ class JointLoss:
         """
         Gaussian negative log likelihood loss for denoising
         """
-        mu = pred_stats[:, 0:1] #mu_x=mu_y
-        std_x = torch.exp(pred_stats[:, 1:2]) #predict log std for numerical stability
-        std_y = std_x + torch.exp(std_noise)
+        eps = 1e-6
+        mu = torch.clamp(pred_stats[:, 0:1], min=-10, max=10)
+        log_std_x = torch.clamp(pred_stats[:, 1:2], min=-10, max=10)
+        std_x = torch.exp(log_std_x)
         
-        #print(noisy_input.shape, mu.shape, std_y.shape, pred_stats.shape, 'loss')
+        # Clamp noise estimate
+        log_std_noise = torch.clamp(std_noise, min=-10, max=10)
+        std_noise = torch.exp(log_std_noise)
         
-        loss = torch.log(std_y) + 0.5 * ((noisy_input - mu)**2 / std_y**2)
+        var_y = std_x**2 + std_noise**2 + eps
+        std_y = torch.sqrt(var_y)
+        
+        
+        loss = (torch.log(std_y + eps) + 
+                0.5 * ((noisy_input - mu)**2) / (var_y))
+        
         if padding_mask is not None:
             loss = loss * padding_mask
             
@@ -53,5 +62,6 @@ class JointLoss:
             
         return total_loss, {
             'denoising_loss': denoising_loss.item(),
-            'detection_loss': detection_loss.item()
+            'detection_loss': detection_loss.item(),
+            'total_loss': total_loss.item()
         }
